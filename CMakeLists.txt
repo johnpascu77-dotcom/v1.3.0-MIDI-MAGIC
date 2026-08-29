@@ -47,6 +47,7 @@ target_sources(MidiPatternLauncher
     PRIVATE
         Source/PluginProcessor.cpp
         Source/PluginEditor.cpp
+        Source/ComposerBridgeIpcClient.cpp
 )
 
 target_include_directories(MidiPatternLauncher

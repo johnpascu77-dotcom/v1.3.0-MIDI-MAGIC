@@ -1,5 +1,6 @@
 #include "PluginProcessor.h"
 #include "PluginEditor.h"
+#include "ComposerBridgeIpcClient.h"
 
 #include <cmath>
 #include <algorithm>
@@ -18,10 +19,16 @@ MidiPatternLauncherAudioProcessor::MidiPatternLauncherAudioProcessor()
 #if JUCE_DEBUG
     runComposerBridgeProtocolSelfTest();
 #endif
+
+    composerBridgeIpcClient = std::make_unique<ComposerBridgeIpcClient>(*this);
 }
 
 MidiPatternLauncherAudioProcessor::~MidiPatternLauncherAudioProcessor()
 {
+    // Explicit reset (not just relying on unique_ptr's default destruction
+    // order) so the connection is torn down before anything it might still
+    // call back into is gone.
+    composerBridgeIpcClient.reset();
 }
 
 juce::AudioProcessorValueTreeState::ParameterLayout MidiPatternLauncherAudioProcessor::createParameterLayout()
@@ -74,13 +81,35 @@ juce::AudioProcessorValueTreeState::ParameterLayout MidiPatternLauncherAudioProc
         },
         0));
 
-    parameters.push_back(std::make_unique<juce::AudioParameterFloat>(
+    // v1.28.0: Swing narrowed from a continuous slider to a 3-state choice
+    // (Off/Triplet/Shuffle) - a continuous value almost always landed
+    // somewhere between the range's only clean ratios, musically ambiguous
+    // rather than a genuine third feel. Shuffle's own percent
+    // (kShuffleSwingPercent) is 100%, not the range's old 75% historical
+    // maximum - see that constant's own comment for why. See
+    // getGlobalSwingAmount().
+    parameters.push_back(std::make_unique<juce::AudioParameterChoice>(
         juce::ParameterID("globalSwingParam", 1),
         "Swing",
-        juce::NormalisableRange<float>(0.0f, 75.0f, 0.1f),
-        0.0f,
-        juce::AudioParameterFloatAttributes()
-            .withLabel("%")));
+        juce::StringArray{ "Off", "Triplet", "Shuffle" },
+        0));
+
+    // v1.29.0: Rate - a real classical augmentation/diminution device (the
+    // whole active pattern restated in longer or shorter note values,
+    // onsets AND durations both scaling together, not just a faster/slower
+    // scrub) - global per-instance rather than per-pattern, same footprint
+    // as Swing above and for the same reasons: "voice" in the conductor
+    // plugin's own vocabulary already means "one MPL instance," and every CC
+    // slot in the per-pattern 30-35/40-45/50-55 blocks is already spoken for
+    // (see handleExternalControlCC). Kept to 3 states on purpose, the same
+    // restraint Swing itself went through - a continuous rate knob would
+    // read as sloppy next to three clean, musically-legible choices. See
+    // getGlobalRateMultiplier().
+    parameters.push_back(std::make_unique<juce::AudioParameterChoice>(
+        juce::ParameterID("globalRateParam", 1),
+        "Rate",
+        juce::StringArray{ "Augmented", "Normal", "Diminished" },
+        1));
 
     parameters.push_back(std::make_unique<juce::AudioParameterInt>(
         juce::ParameterID("targetStepParam", 1),
@@ -144,6 +173,16 @@ juce::AudioProcessorValueTreeState::ParameterLayout MidiPatternLauncherAudioProc
             juce::ParameterID("p" + juce::String(patternNumber) + "InversionParam", 1),
             "P" + juce::String(patternNumber) + " Inversion",
             false));
+
+        parameters.push_back(std::make_unique<juce::AudioParameterBool>(
+            juce::ParameterID("p" + juce::String(patternNumber) + "RetrogradeParam", 1),
+            "P" + juce::String(patternNumber) + " Retrograde",
+            false));
+
+        parameters.push_back(std::make_unique<juce::AudioParameterBool>(
+            juce::ParameterID("p" + juce::String(patternNumber) + "M7Param", 1),
+            "P" + juce::String(patternNumber) + " M7",
+            false));
     }
 
     return { parameters.begin(), parameters.end() };
@@ -169,9 +208,34 @@ bool MidiPatternLauncherAudioProcessor::isTernaryGridMode() const
     return getGridModeIndex() == 1;
 }
 
+int MidiPatternLauncherAudioProcessor::getGlobalSwingIndex() const
+{
+    return juce::jlimit(0, 2, getChoiceParameterIndex("globalSwingParam"));
+}
+
 float MidiPatternLauncherAudioProcessor::getGlobalSwingAmount() const
 {
-    return juce::jlimit(0.0f, 75.0f, getFloatParameterValue("globalSwingParam"));
+    switch (getGlobalSwingIndex())
+    {
+        case 1:  return kTripletSwingPercent;
+        case 2:  return kShuffleSwingPercent;
+        default: return 0.0f;
+    }
+}
+
+int MidiPatternLauncherAudioProcessor::getGlobalRateIndex() const
+{
+    return juce::jlimit(0, 2, getChoiceParameterIndex("globalRateParam"));
+}
+
+float MidiPatternLauncherAudioProcessor::getGlobalRateMultiplier() const
+{
+    switch (getGlobalRateIndex())
+    {
+        case 0:  return 0.5f;  // Augmented - restated in longer values, slower
+        case 2:  return 2.0f;  // Diminished - restated in shorter values, faster
+        default: return 1.0f;  // Normal
+    }
 }
 
 bool MidiPatternLauncherAudioProcessor::isExternalControlEnabled() const
@@ -193,6 +257,26 @@ int MidiPatternLauncherAudioProcessor::getExternalControlChannel() const
 int MidiPatternLauncherAudioProcessor::getEditorViewModeIndex() const
 {
     return juce::jlimit(0, 1, getChoiceParameterIndex("editorViewModeParam"));
+}
+
+int MidiPatternLauncherAudioProcessor::getDebugLastCCNumber() const
+{
+    return debugLastCCNumber.load();
+}
+
+int MidiPatternLauncherAudioProcessor::getDebugLastCCChannel() const
+{
+    return debugLastCCChannel.load();
+}
+
+int MidiPatternLauncherAudioProcessor::getDebugLastCCValue() const
+{
+    return debugLastCCValue.load();
+}
+
+bool MidiPatternLauncherAudioProcessor::getDebugLastCCAccepted() const
+{
+    return debugLastCCAccepted.load();
 }
 
 bool MidiPatternLauncherAudioProcessor::isMelodyPaintMode() const
@@ -331,6 +415,8 @@ void MidiPatternLauncherAudioProcessor::syncParametersFromPattern(int patternInd
     const int rotation = getPatternRotation(patternIndex);
     const int length = getPatternLoopLength(patternIndex);
     const bool inversion = getPatternInverted(patternIndex);
+    const bool retrograde = getPatternRetrograde(patternIndex);
+    const bool m7 = getPatternM7(patternIndex);
 
     suppressParameterSync.store(true);
 
@@ -345,6 +431,12 @@ void MidiPatternLauncherAudioProcessor::syncParametersFromPattern(int patternInd
 
     setParameterPlainValueNotifyingHost(getInversionParameterID(patternIndex),
         inversion ? 1.0f : 0.0f);
+
+    setParameterPlainValueNotifyingHost(getRetrogradeParameterID(patternIndex),
+        retrograde ? 1.0f : 0.0f);
+
+    setParameterPlainValueNotifyingHost(getM7ParameterID(patternIndex),
+        m7 ? 1.0f : 0.0f);
 
     suppressParameterSync.store(false);
 }
@@ -433,11 +525,15 @@ void MidiPatternLauncherAudioProcessor::syncEngineFromParameters()
             getIntParameterValue(getLengthParameterID(patternIndex)));
 
         const bool inversionParam = getBoolParameterValue(getInversionParameterID(patternIndex));
+        const bool retrogradeParam = getBoolParameterValue(getRetrogradeParameterID(patternIndex));
+        const bool m7Param = getBoolParameterValue(getM7ParameterID(patternIndex));
 
         patternTranspose[static_cast<size_t>(patternIndex)] = transposeParam;
         patternRotation[static_cast<size_t>(patternIndex)] = rotationParam;
         patternLoopLength[static_cast<size_t>(patternIndex)] = lengthParam;
         patternInverted[static_cast<size_t>(patternIndex)] = inversionParam;
+        patternRetrograde[static_cast<size_t>(patternIndex)] = retrogradeParam;
+        patternM7[static_cast<size_t>(patternIndex)] = m7Param;
     }
 
     const int targetPatternParam = juce::jlimit(0,
@@ -472,13 +568,31 @@ void MidiPatternLauncherAudioProcessor::syncEngineFromParameters()
         || targetDurationParam != lastTargetDurationParam
         || targetEnabledParam != lastTargetEnabledParam;
 
-    if (targetSelectionChanged)
-    {
-        syncTargetParametersFromStep();
-    }
-    else if (targetValuesChanged)
+    // Commit takes priority over browse when both change in the same poll.
+    // A human using the plugin's own UI never hits this ambiguity - clicking
+    // a step calls setTargetPatternAndStep() directly (guarded by
+    // suppressParameterSync, bypassing this poll entirely), so pure
+    // navigation only ever shows up here as a selection change with no
+    // accompanying value change. An external CC burst (Composer
+    // Mastermind's Target Step protocol, CC 21/60-64) is different: it
+    // always sends a new step selection *and* new note/velocity/duration/
+    // enabled together as one atomic edit, and by the time this poll next
+    // runs both flags are true simultaneously. Checking selection first
+    // used to mean browse always won that race, silently reloading the new
+    // step's pre-existing content over the incoming values - every
+    // programmatic edit that also changed step selection (i.e. nearly all
+    // of them) was discarded without any error, confirmed via Composer
+    // Mastermind's motif engine writing hundreds of steps at bar 44 with
+    // subsequent zero audible change. Commit-first fixes this: "select this
+    // new step and set it to these values" is treated as one edit, not
+    // browse-then-lose-the-values.
+    if (targetValuesChanged)
     {
         syncTargetStepFromParameters();
+    }
+    else if (targetSelectionChanged)
+    {
+        syncTargetParametersFromStep();
     }
 }
 
@@ -749,6 +863,12 @@ void MidiPatternLauncherAudioProcessor::copyPattern(int sourcePatternIndex, int 
     patternInverted[static_cast<size_t>(destinationPatternIndex)] =
         patternInverted[static_cast<size_t>(sourcePatternIndex)];
 
+    patternRetrograde[static_cast<size_t>(destinationPatternIndex)] =
+        patternRetrograde[static_cast<size_t>(sourcePatternIndex)];
+
+    patternM7[static_cast<size_t>(destinationPatternIndex)] =
+        patternM7[static_cast<size_t>(sourcePatternIndex)];
+
     updateAutomationParametersForPattern(destinationPatternIndex);
 }
 
@@ -766,6 +886,8 @@ void MidiPatternLauncherAudioProcessor::clearPattern(int patternIndex)
     patternRotation[static_cast<size_t>(patternIndex)] = 0;
     patternLoopLength[static_cast<size_t>(patternIndex)] = defaultPatternLoopLength;
     patternInverted[static_cast<size_t>(patternIndex)] = false;
+    patternRetrograde[static_cast<size_t>(patternIndex)] = false;
+    patternM7[static_cast<size_t>(patternIndex)] = false;
 
     updateAutomationParametersForPattern(patternIndex);
 }
@@ -812,8 +934,8 @@ int MidiPatternLauncherAudioProcessor::getTransposedStepNote(int patternIndex, i
 // v1.5.0 inversion helpers.
 // These are non-destructive: stored step notes are never rewritten.
 //
-// Transform order:
-//   Stored Note -> Inversion -> Transposition -> MIDI Output
+// Transform order (v1.27.0 adds M7 ahead of Inversion):
+//   Stored Note -> M7 -> Inversion -> Transposition -> MIDI Output
 //
 // Inversion axis:
 //   60 = middle C / C4.
@@ -846,6 +968,52 @@ void MidiPatternLauncherAudioProcessor::setPatternInverted(int patternIndex, boo
 
     patternInverted[static_cast<size_t>(patternIndex)] = shouldBeInverted;
 }
+//==============================================================================
+// v1.27.0 M7 helpers.
+// Non-destructive, like Inversion above: stored step notes are never
+// rewritten. M7 is interval multiplication by 7 mod 12 - a classic
+// twelve-tone/set-theory row operation distinct from Transpose/Inversion/
+// Retrograde (each of those is additive or reflective; M7 is a genuine
+// permutation of the twelve pitch classes). Only the pitch class (note % 12)
+// is transformed; the note's octave register is left alone so the result
+// stays in roughly the same range as the stored note.
+//
+//   pitchClass' = (pitchClass * 7) mod 12
+//
+//   Example (pitch class only):
+//     0  (C)  -> 0  (C)
+//     1  (C#) -> 7  (G)
+//     2  (D)  -> 2  (D)
+//     4  (E)  -> 4  (E)
+//     7  (G)  -> 1  (C#)
+//
+// M7 is its own inverse (7 * 7 mod 12 == 1), so toggling it twice is a
+// no-op - the same self-cancelling character as Inversion.
+
+bool MidiPatternLauncherAudioProcessor::getPatternM7(int patternIndex) const
+{
+    if (patternIndex < 0 || patternIndex >= numPatterns)
+        return false;
+
+    return patternM7[static_cast<size_t>(patternIndex)];
+}
+
+void MidiPatternLauncherAudioProcessor::togglePatternM7(int patternIndex)
+{
+    if (patternIndex < 0 || patternIndex >= numPatterns)
+        return;
+
+    auto& m7 = patternM7[static_cast<size_t>(patternIndex)];
+    m7 = !m7;
+}
+
+void MidiPatternLauncherAudioProcessor::setPatternM7(int patternIndex, bool shouldBeM7)
+{
+    if (patternIndex < 0 || patternIndex >= numPatterns)
+        return;
+
+    patternM7[static_cast<size_t>(patternIndex)] = shouldBeM7;
+}
 
 int MidiPatternLauncherAudioProcessor::applyPatternTransformsToNote(int patternIndex, int note) const
 {
@@ -853,6 +1021,13 @@ int MidiPatternLauncherAudioProcessor::applyPatternTransformsToNote(int patternI
         return -1;
 
     int transformedNote = note;
+
+    if (getPatternM7(patternIndex))
+    {
+        const int pitchClass = transformedNote % 12;
+        const int m7PitchClass = (pitchClass * 7) % 12;
+        transformedNote = transformedNote - pitchClass + m7PitchClass;
+    }
 
     if (getPatternInverted(patternIndex))
         transformedNote = (inversionAxisNote * 2) - transformedNote;
@@ -885,6 +1060,38 @@ int MidiPatternLauncherAudioProcessor::getTransformedStepNote(int patternIndex, 
     return applyPatternTransformsToNote(patternIndex, step.note);
 }
 //==============================================================================
+// v1.26.0 retrograde helpers.
+// Non-destructive, like Inversion above: the stored step order is never
+// rewritten, only reflected at read time inside getRotatedSourceStepIndex().
+// Combining Retrograde with Inversion (both independent toggles) produces the
+// classic Retrograde-Inversion (RI) twelve-tone row form without needing a
+// dedicated third toggle for it.
+
+bool MidiPatternLauncherAudioProcessor::getPatternRetrograde(int patternIndex) const
+{
+    if (patternIndex < 0 || patternIndex >= numPatterns)
+        return false;
+
+    return patternRetrograde[static_cast<size_t>(patternIndex)];
+}
+
+void MidiPatternLauncherAudioProcessor::togglePatternRetrograde(int patternIndex)
+{
+    if (patternIndex < 0 || patternIndex >= numPatterns)
+        return;
+
+    auto& retrograde = patternRetrograde[static_cast<size_t>(patternIndex)];
+    retrograde = !retrograde;
+}
+
+void MidiPatternLauncherAudioProcessor::setPatternRetrograde(int patternIndex, bool shouldBeRetrograde)
+{
+    if (patternIndex < 0 || patternIndex >= numPatterns)
+        return;
+
+    patternRetrograde[static_cast<size_t>(patternIndex)] = shouldBeRetrograde;
+}
+//==============================================================================
 // v1.4.0 rotation helpers.
 // These are non-destructive: they do not move or rewrite stored step data.
 //
@@ -898,6 +1105,11 @@ int MidiPatternLauncherAudioProcessor::getTransformedStepNote(int patternIndex, 
 //   sourceStepIndex = stepIndex - rotation
 //
 // with wraparound inside 0..15.
+//
+// v1.26.0: if Retrograde is on for this pattern, the loop-relative playback
+// position is reflected around the loop's midpoint *before* rotation is
+// subtracted, so the stored steps are read back to front. Rotation still
+// shifts where in that (possibly reversed) traversal playback starts.
 
 int MidiPatternLauncherAudioProcessor::getPatternRotation(int patternIndex) const
 {
@@ -934,7 +1146,11 @@ int MidiPatternLauncherAudioProcessor::getRotatedSourceStepIndex(int patternInde
 
     const int effectiveRotation = ((rotation % loopLength) + loopLength) % loopLength;
 
-    return ((playbackStepIndex - effectiveRotation) % loopLength + loopLength) % loopLength;
+    const int reflectedStepIndex = getPatternRetrograde(patternIndex)
+        ? (loopLength - 1 - playbackStepIndex)
+        : playbackStepIndex;
+
+    return ((reflectedStepIndex - effectiveRotation) % loopLength + loopLength) % loopLength;
 }
 
 int MidiPatternLauncherAudioProcessor::getPatternLoopLength(int patternIndex) const
@@ -1025,6 +1241,16 @@ juce::String MidiPatternLauncherAudioProcessor::getInversionParameterID(int patt
     return "p" + juce::String(patternIndex + 1) + "InversionParam";
 }
 
+juce::String MidiPatternLauncherAudioProcessor::getRetrogradeParameterID(int patternIndex) const
+{
+    return "p" + juce::String(patternIndex + 1) + "RetrogradeParam";
+}
+
+juce::String MidiPatternLauncherAudioProcessor::getM7ParameterID(int patternIndex) const
+{
+    return "p" + juce::String(patternIndex + 1) + "M7Param";
+}
+
 int MidiPatternLauncherAudioProcessor::getNumPrograms()
 {
     return 1;
@@ -1060,6 +1286,15 @@ void MidiPatternLauncherAudioProcessor::prepareToPlay(double sampleRate, int sam
 
     activePattern = -1;
     pendingPattern = -2;
+
+    // Sentinel outside activeParam's clamped [0, numPatterns] range, so the
+    // very next syncEngineFromParameters() call is guaranteed to see it as a
+    // "change" and queue whatever pattern the Active Pattern knob currently
+    // shows - without this, activePattern/pendingPattern get reset above but
+    // lastActivePatternParam doesn't, so if the knob's value already matches
+    // it (e.g. right after setStateInformation restored it), the queue never
+    // fires and playback stays silently stopped until the knob is nudged.
+    lastActivePatternParam = -1;
 
     patternStartStep = 0;
     lastPlayedStep = -1;
@@ -1098,6 +1333,7 @@ bool MidiPatternLauncherAudioProcessor::isBusesLayoutSupported(const BusesLayout
 
 void MidiPatternLauncherAudioProcessor::sendComposerBridgeResponse(juce::MidiBuffer& midiMessages,
     int sampleOffset,
+    int channel,
     int status,
     int originalCommand,
     int detail)
@@ -1106,7 +1342,8 @@ void MidiPatternLauncherAudioProcessor::sendComposerBridgeResponse(juce::MidiBuf
     {
         0x7D,             // Non-commercial SysEx manufacturer ID
         0x4D, 0x50, 0x4C, // ASCII "MPL"
-        0x01,             // Protocol version
+        0x02,             // Protocol version
+        static_cast<juce::uint8>(juce::jlimit(0, 127, channel)), // Echo of the request's target channel
         0x7F,             // Response command
         static_cast<juce::uint8>(juce::jlimit(0, 127, status)),
         static_cast<juce::uint8>(juce::jlimit(0, 127, originalCommand)),
@@ -1119,16 +1356,18 @@ void MidiPatternLauncherAudioProcessor::sendComposerBridgeResponse(juce::MidiBuf
 
 void MidiPatternLauncherAudioProcessor::sendComposerBridgePatternDump(juce::MidiBuffer& midiMessages,
     int sampleOffset,
+    int channel,
     int patternIndex)
 {
     std::vector<juce::uint8> payload;
-    payload.reserve(8 + (patternLength * 4));
+    payload.reserve(9 + (patternLength * 4));
 
     payload.push_back(0x7D);             // Non-commercial SysEx manufacturer ID
     payload.push_back(0x4D);             // ASCII "M"
     payload.push_back(0x50);             // ASCII "P"
     payload.push_back(0x4C);             // ASCII "L"
-    payload.push_back(0x01);             // Protocol version
+    payload.push_back(0x02);             // Protocol version
+    payload.push_back(static_cast<juce::uint8>(juce::jlimit(0, 127, channel))); // Echo of the request's target channel
     payload.push_back(0x06);             // Pattern dump response command
     payload.push_back(static_cast<juce::uint8>(juce::jlimit(0, 127, patternIndex)));
     payload.push_back(static_cast<juce::uint8>(patternLength));
@@ -1155,6 +1394,7 @@ bool MidiPatternLauncherAudioProcessor::runComposerBridgeProtocolSelfTest()
 {
     struct ExpectedResponse
     {
+        int channel = -1;
         int status = -1;
         int originalCommand = -1;
         int detail = -1;
@@ -1163,6 +1403,7 @@ bool MidiPatternLauncherAudioProcessor::runComposerBridgeProtocolSelfTest()
     struct ExpectedPatternDump
     {
         bool found = false;
+        int channel = -1;
         int patternIndex = -1;
         int stepCount = -1;
         int step0Enabled = -1;
@@ -1191,20 +1432,21 @@ bool MidiPatternLauncherAudioProcessor::runComposerBridgeProtocolSelfTest()
             const auto* data = message.getSysExData();
             const int dataSize = message.getSysExDataSize();
 
-            if (dataSize < 9)
+            if (dataSize < 10)
                 continue;
 
             if (data[0] != 0x7D
                 || data[1] != 0x4D
                 || data[2] != 0x50
                 || data[3] != 0x4C
-                || data[4] != 0x01
-                || data[5] != 0x7F)
+                || data[4] != 0x02
+                || data[6] != 0x7F)
                 continue;
 
-            response.status = data[6];
-            response.originalCommand = data[7];
-            response.detail = data[8];
+            response.channel = data[5];
+            response.status = data[7];
+            response.originalCommand = data[8];
+            response.detail = data[9];
             break;
         }
 
@@ -1225,24 +1467,25 @@ bool MidiPatternLauncherAudioProcessor::runComposerBridgeProtocolSelfTest()
             const auto* data = message.getSysExData();
             const int dataSize = message.getSysExDataSize();
 
-            if (dataSize < 12)
+            if (dataSize < 13)
                 continue;
 
             if (data[0] != 0x7D
                 || data[1] != 0x4D
                 || data[2] != 0x50
                 || data[3] != 0x4C
-                || data[4] != 0x01
-                || data[5] != 0x06)
+                || data[4] != 0x02
+                || data[6] != 0x06)
                 continue;
 
             dump.found = true;
-            dump.patternIndex = data[6];
-            dump.stepCount = data[7];
-            dump.step0Enabled = data[8];
-            dump.step0Note = data[9];
-            dump.step0Velocity = data[10];
-            dump.step0Duration = data[11];
+            dump.channel = data[5];
+            dump.patternIndex = data[7];
+            dump.stepCount = data[8];
+            dump.step0Enabled = data[9];
+            dump.step0Note = data[10];
+            dump.step0Velocity = data[11];
+            dump.step0Duration = data[12];
             break;
         }
 
@@ -1279,15 +1522,15 @@ bool MidiPatternLauncherAudioProcessor::runComposerBridgeProtocolSelfTest()
 
     bool allPassed = true;
 
-    // Valid set step:
-    // 7D 4D 50 4C 01 01 pattern step enabled note velocity duration
+    // Valid set step, channel 0 ("All" - respond regardless of configured channel):
+    // 7D 4D 50 4C 02 channel 01 pattern step enabled note velocity duration
     allPassed &= runCase("set step ACK",
-        { 0x7D, 0x4D, 0x50, 0x4C, 0x01, 0x01, 0x00, 0x00, 0x01, 60, 100, 1 },
+        { 0x7D, 0x4D, 0x50, 0x4C, 0x02, 0x00, 0x01, 0x00, 0x00, 0x01, 60, 100, 1 },
         0x00, 0x01, 0x00);
 
     {
         juce::MidiBuffer responses;
-        const auto message = makeMessage({ 0x7D, 0x4D, 0x50, 0x4C, 0x01, 0x05, 0x00 });
+        const auto message = makeMessage({ 0x7D, 0x4D, 0x50, 0x4C, 0x02, 0x00, 0x05, 0x00 });
 
         const bool handled = handleComposerBridgeSysEx(message, responses, 0);
         const auto ack = readSingleResponse(responses);
@@ -1298,6 +1541,7 @@ bool MidiPatternLauncherAudioProcessor::runComposerBridgeProtocolSelfTest()
             && ack.originalCommand == 0x05
             && ack.detail == 0x00
             && dump.found
+            && dump.channel == 0x00
             && dump.patternIndex == 0x00
             && dump.stepCount == patternLength
             && dump.step0Enabled == 0x01
@@ -1312,6 +1556,7 @@ bool MidiPatternLauncherAudioProcessor::runComposerBridgeProtocolSelfTest()
             + " handled=" + juce::String(handled ? "true" : "false")
             + " ackStatus=" + juce::String(ack.status)
             + " dumpFound=" + juce::String(dump.found ? "true" : "false")
+            + " dumpChannel=" + juce::String(dump.channel)
             + " pattern=" + juce::String(dump.patternIndex)
             + " steps=" + juce::String(dump.stepCount)
             + " step0Enabled=" + juce::String(dump.step0Enabled)
@@ -1322,23 +1567,54 @@ bool MidiPatternLauncherAudioProcessor::runComposerBridgeProtocolSelfTest()
 
     // Malformed set step: command present but missing required payload bytes.
     allPassed &= runCase("malformed set step NACK",
-        { 0x7D, 0x4D, 0x50, 0x4C, 0x01, 0x01, 0x00 },
+        { 0x7D, 0x4D, 0x50, 0x4C, 0x02, 0x00, 0x01, 0x00 },
         0x01, 0x01, 0x00);
 
     // Invalid pattern index.
     allPassed &= runCase("invalid pattern NACK",
-        { 0x7D, 0x4D, 0x50, 0x4C, 0x01, 0x01, 0x7F, 0x00, 0x01, 60, 100, 1 },
+        { 0x7D, 0x4D, 0x50, 0x4C, 0x02, 0x00, 0x01, 0x7F, 0x00, 0x01, 60, 100, 1 },
         0x02, 0x01, 0x7F);
 
     // Invalid step index.
     allPassed &= runCase("invalid step NACK",
-        { 0x7D, 0x4D, 0x50, 0x4C, 0x01, 0x01, 0x00, 0x7F, 0x01, 60, 100, 1 },
+        { 0x7D, 0x4D, 0x50, 0x4C, 0x02, 0x00, 0x01, 0x00, 0x7F, 0x01, 60, 100, 1 },
         0x03, 0x01, 0x7F);
 
     // Unsupported command.
     allPassed &= runCase("unsupported command NACK",
-        { 0x7D, 0x4D, 0x50, 0x4C, 0x01, 0x7E },
+        { 0x7D, 0x4D, 0x50, 0x4C, 0x02, 0x00, 0x7E },
         0x04, 0x7E, 0x00);
+
+    // Channel filtering: force a specific configured channel, then verify a
+    // matching request is answered and a mismatched one is silently ignored
+    // (no response of any kind - the whole point, since a non-addressed
+    // instance must never reply). Restores whatever was configured before,
+    // same "leave no trace" spirit as clearStep(0, 0) below.
+    {
+        const int originalChannelIndex = getChoiceParameterIndex("externalControlChannelParam");
+        setParameterPlainValueNotifyingHost("externalControlChannelParam", 3.0f); // channel 3
+
+        allPassed &= runCase("channel match ACK",
+            { 0x7D, 0x4D, 0x50, 0x4C, 0x02, 0x03, 0x01, 0x00, 0x00, 0x01, 60, 100, 1 },
+            0x00, 0x01, 0x00);
+
+        {
+            juce::MidiBuffer responses;
+            const auto message = makeMessage(
+                { 0x7D, 0x4D, 0x50, 0x4C, 0x02, 0x05, 0x01, 0x00, 0x00, 0x01, 60, 100, 1 });
+
+            const bool handled = handleComposerBridgeSysEx(message, responses, 0);
+            const bool passed = !handled && responses.getNumEvents() == 0;
+            allPassed &= passed;
+
+            DBG(juce::String("Composer Bridge self-test: channel mismatch silently ignored ")
+                + (passed ? "PASS" : "FAIL")
+                + " handled=" + juce::String(handled ? "true" : "false")
+                + " responseCount=" + juce::String(responses.getNumEvents()));
+        }
+
+        setParameterPlainValueNotifyingHost("externalControlChannelParam", static_cast<float>(originalChannelIndex));
+    }
 
     DBG(juce::String("Composer Bridge self-test overall: ")
         + (allPassed ? "PASS" : "FAIL"));
@@ -1362,25 +1638,37 @@ bool MidiPatternLauncherAudioProcessor::handleComposerBridgeSysEx(const juce::Mi
     const auto* data = message.getSysExData();
     const int dataSize = message.getSysExDataSize();
 
-    // v1.22.0 Composer Bridge SysEx protocol.
+    // v1.23.0 Composer Bridge SysEx protocol.
     //
     // JUCE exposes only the payload bytes between F0 and F7 via getSysExData().
     //
     // Header:
-    //   7D 4D 50 4C 01
+    //   7D 4D 50 4C 02 channel
     //
     // 7D       = non-commercial/educational SysEx manufacturer ID
     // 4D 50 4C = ASCII "MPL"
-    // 01       = protocol version
+    // 02       = protocol version (bumped from 01: adds the channel byte below)
+    // channel  = target instance channel, 0..16 - mirrors externalControlChannelParam's
+    //            own convention (0 = respond regardless of configured channel, 1..16 =
+    //            only respond if externalControlChannelParam equals this value). Every
+    //            response echoes back whichever channel value arrived in the request
+    //            it's answering, so a client addressing multiple instances can always
+    //            attribute a response without relying on request/response ordering.
+    //            Added because SysEx carries no MIDI channel of its own the way Control
+    //            Change messages do - without this, every instance with Composer Bridge
+    //            enabled would answer every request, since they all listen to the same
+    //            broadcast MIDI stream from a single external controller track (see
+    //            ComposerMastermind's docs/routing_policy_v0_1.md).
     //
     // Commands:
     //   01 pattern step enabled note velocity duration
     //   02 pattern
     //   03 sourcePattern destinationPattern
     //   04 pattern [16 x enabled note velocity duration]
+    //   05 pattern
     //
     // Response:
-    //   7D 4D 50 4C 01 7F status originalCommand detail
+    //   7D 4D 50 4C 02 channel 7F status originalCommand detail
     //
     // Status:
     //   00 ACK / success
@@ -1393,10 +1681,11 @@ bool MidiPatternLauncherAudioProcessor::handleComposerBridgeSysEx(const juce::Mi
     constexpr uint8 magicM = 0x4D;
     constexpr uint8 magicP = 0x50;
     constexpr uint8 magicL = 0x4C;
-    constexpr uint8 protocolVersion = 0x01;
+    constexpr uint8 protocolVersion = 0x02;
 
     constexpr int headerSize = 5;
-    constexpr int commandIndex = headerSize;
+    constexpr int channelIndex = headerSize;
+    constexpr int commandIndex = headerSize + 1;
 
     constexpr int responseAck = 0x00;
     constexpr int responseMalformed = 0x01;
@@ -1404,7 +1693,7 @@ bool MidiPatternLauncherAudioProcessor::handleComposerBridgeSysEx(const juce::Mi
     constexpr int responseInvalidStep = 0x03;
     constexpr int responseUnsupportedCommand = 0x04;
 
-    if (dataSize < headerSize + 1)
+    if (dataSize < commandIndex + 1)
         return false;
 
     if (static_cast<uint8>(data[0]) != manufacturerId
@@ -1415,6 +1704,15 @@ bool MidiPatternLauncherAudioProcessor::handleComposerBridgeSysEx(const juce::Mi
     {
         return false;
     }
+
+    const int channel = static_cast<int>(static_cast<uint8>(data[channelIndex]));
+
+    // Every MPL instance with Composer Bridge enabled listens to the same broadcast
+    // MIDI stream, so without this filter every instance would answer every request.
+    // Mirrors handleExternalControlCC's own channel check exactly.
+    const int listenChannel = getExternalControlChannel();
+    if (listenChannel != 0 && channel != listenChannel)
+        return false;
 
     const int command = static_cast<int>(static_cast<uint8>(data[commandIndex]));
 
@@ -1436,7 +1734,7 @@ bool MidiPatternLauncherAudioProcessor::handleComposerBridgeSysEx(const juce::Mi
 
             if (dataSize < requiredSize)
             {
-                sendComposerBridgeResponse(midiMessages, sampleOffset, responseMalformed, command, 0);
+                sendComposerBridgeResponse(midiMessages, sampleOffset, channel, responseMalformed, command, 0);
                 return true;
             }
 
@@ -1449,13 +1747,13 @@ bool MidiPatternLauncherAudioProcessor::handleComposerBridgeSysEx(const juce::Mi
 
             if (patternIndex < 0 || patternIndex >= numPatterns)
             {
-                sendComposerBridgeResponse(midiMessages, sampleOffset, responseInvalidPattern, command, patternIndex);
+                sendComposerBridgeResponse(midiMessages, sampleOffset, channel, responseInvalidPattern, command, patternIndex);
                 return true;
             }
 
             if (stepIndex < 0 || stepIndex >= patternLength)
             {
-                sendComposerBridgeResponse(midiMessages, sampleOffset, responseInvalidStep, command, stepIndex);
+                sendComposerBridgeResponse(midiMessages, sampleOffset, channel, responseInvalidStep, command, stepIndex);
                 return true;
             }
 
@@ -1464,7 +1762,7 @@ bool MidiPatternLauncherAudioProcessor::handleComposerBridgeSysEx(const juce::Mi
             else
                 clearStep(patternIndex, stepIndex);
 
-            sendComposerBridgeResponse(midiMessages, sampleOffset, responseAck, command, 0);
+            sendComposerBridgeResponse(midiMessages, sampleOffset, channel, responseAck, command, 0);
             return true;
         }
 
@@ -1476,7 +1774,7 @@ bool MidiPatternLauncherAudioProcessor::handleComposerBridgeSysEx(const juce::Mi
 
             if (dataSize < requiredSize)
             {
-                sendComposerBridgeResponse(midiMessages, sampleOffset, responseMalformed, command, 0);
+                sendComposerBridgeResponse(midiMessages, sampleOffset, channel, responseMalformed, command, 0);
                 return true;
             }
 
@@ -1484,13 +1782,13 @@ bool MidiPatternLauncherAudioProcessor::handleComposerBridgeSysEx(const juce::Mi
 
             if (patternIndex < 0 || patternIndex >= numPatterns)
             {
-                sendComposerBridgeResponse(midiMessages, sampleOffset, responseInvalidPattern, command, patternIndex);
+                sendComposerBridgeResponse(midiMessages, sampleOffset, channel, responseInvalidPattern, command, patternIndex);
                 return true;
             }
 
             clearPattern(patternIndex);
 
-            sendComposerBridgeResponse(midiMessages, sampleOffset, responseAck, command, 0);
+            sendComposerBridgeResponse(midiMessages, sampleOffset, channel, responseAck, command, 0);
             return true;
         }
 
@@ -1502,7 +1800,7 @@ bool MidiPatternLauncherAudioProcessor::handleComposerBridgeSysEx(const juce::Mi
 
             if (dataSize < requiredSize)
             {
-                sendComposerBridgeResponse(midiMessages, sampleOffset, responseMalformed, command, 0);
+                sendComposerBridgeResponse(midiMessages, sampleOffset, channel, responseMalformed, command, 0);
                 return true;
             }
 
@@ -1511,19 +1809,19 @@ bool MidiPatternLauncherAudioProcessor::handleComposerBridgeSysEx(const juce::Mi
 
             if (sourcePatternIndex < 0 || sourcePatternIndex >= numPatterns)
             {
-                sendComposerBridgeResponse(midiMessages, sampleOffset, responseInvalidPattern, command, sourcePatternIndex);
+                sendComposerBridgeResponse(midiMessages, sampleOffset, channel, responseInvalidPattern, command, sourcePatternIndex);
                 return true;
             }
 
             if (destinationPatternIndex < 0 || destinationPatternIndex >= numPatterns)
             {
-                sendComposerBridgeResponse(midiMessages, sampleOffset, responseInvalidPattern, command, destinationPatternIndex);
+                sendComposerBridgeResponse(midiMessages, sampleOffset, channel, responseInvalidPattern, command, destinationPatternIndex);
                 return true;
             }
 
             copyPattern(sourcePatternIndex, destinationPatternIndex);
 
-            sendComposerBridgeResponse(midiMessages, sampleOffset, responseAck, command, 0);
+            sendComposerBridgeResponse(midiMessages, sampleOffset, channel, responseAck, command, 0);
             return true;
         }
 
@@ -1539,7 +1837,7 @@ bool MidiPatternLauncherAudioProcessor::handleComposerBridgeSysEx(const juce::Mi
 
             if (dataSize < requiredSize)
             {
-                sendComposerBridgeResponse(midiMessages, sampleOffset, responseMalformed, command, 0);
+                sendComposerBridgeResponse(midiMessages, sampleOffset, channel, responseMalformed, command, 0);
                 return true;
             }
 
@@ -1547,7 +1845,7 @@ bool MidiPatternLauncherAudioProcessor::handleComposerBridgeSysEx(const juce::Mi
 
             if (patternIndex < 0 || patternIndex >= numPatterns)
             {
-                sendComposerBridgeResponse(midiMessages, sampleOffset, responseInvalidPattern, command, patternIndex);
+                sendComposerBridgeResponse(midiMessages, sampleOffset, channel, responseInvalidPattern, command, patternIndex);
                 return true;
             }
 
@@ -1568,7 +1866,7 @@ bool MidiPatternLauncherAudioProcessor::handleComposerBridgeSysEx(const juce::Mi
                 dataIndex += valuesPerStep;
             }
 
-            sendComposerBridgeResponse(midiMessages, sampleOffset, responseAck, command, 0);
+            sendComposerBridgeResponse(midiMessages, sampleOffset, channel, responseAck, command, 0);
             return true;
         }
 
@@ -1586,7 +1884,7 @@ bool MidiPatternLauncherAudioProcessor::handleComposerBridgeSysEx(const juce::Mi
 
             if (dataSize < requiredSize)
             {
-                sendComposerBridgeResponse(midiMessages, sampleOffset, responseMalformed, command, 0);
+                sendComposerBridgeResponse(midiMessages, sampleOffset, channel, responseMalformed, command, 0);
                 return true;
             }
 
@@ -1594,23 +1892,28 @@ bool MidiPatternLauncherAudioProcessor::handleComposerBridgeSysEx(const juce::Mi
 
             if (patternIndex < 0 || patternIndex >= numPatterns)
             {
-                sendComposerBridgeResponse(midiMessages, sampleOffset, responseInvalidPattern, command, patternIndex);
+                sendComposerBridgeResponse(midiMessages, sampleOffset, channel, responseInvalidPattern, command, patternIndex);
                 return true;
             }
 
-            sendComposerBridgePatternDump(midiMessages, sampleOffset, patternIndex);
-            sendComposerBridgeResponse(midiMessages, sampleOffset, responseAck, command, 0);
+            sendComposerBridgePatternDump(midiMessages, sampleOffset, channel, patternIndex);
+            sendComposerBridgeResponse(midiMessages, sampleOffset, channel, responseAck, command, 0);
             return true;
         }
 
         default:
-            sendComposerBridgeResponse(midiMessages, sampleOffset, responseUnsupportedCommand, command, 0);
+            sendComposerBridgeResponse(midiMessages, sampleOffset, channel, responseUnsupportedCommand, command, 0);
             return true;
     }
 }
 
 bool MidiPatternLauncherAudioProcessor::handleExternalControlCC(const juce::MidiMessage& message)
 {
+    debugLastCCNumber.store(message.getControllerNumber());
+    debugLastCCChannel.store(message.getChannel());
+    debugLastCCValue.store(message.getControllerValue());
+    debugLastCCAccepted.store(false);
+
     if (!message.isController())
         return false;
 
@@ -1637,11 +1940,6 @@ bool MidiPatternLauncherAudioProcessor::handleExternalControlCC(const juce::Midi
             minValue + static_cast<int>(std::round(normalised * static_cast<double>(maxValue - minValue))));
     };
 
-    auto scaleFloat = [ccValue](float minValue, float maxValue)
-    {
-        const float normalised = static_cast<float>(ccValue) / 127.0f;
-        return juce::jlimit(minValue, maxValue, minValue + (normalised * (maxValue - minValue)));
-    };
 
     auto setPlain = [this](const juce::String& parameterID, float plainValue)
     {
@@ -1652,62 +1950,149 @@ bool MidiPatternLauncherAudioProcessor::handleExternalControlCC(const juce::Midi
     {
         case 20: // Active Pattern: 0 = Stopped, 1..3 = Pattern 1..3
             setPlain("activePatternParam", static_cast<float>(scaleInt(0, numPatterns)));
+            debugLastCCAccepted.store(true);
+            return true;
+
+        case 21: // Target Pattern: selects which pattern subsequent Target Step edits apply to
+            setPlain("targetPatternParam", static_cast<float>(scaleInt(0, numPatterns - 1)));
+            debugLastCCAccepted.store(true);
             return true;
 
         case 22: // Grid Mode: Binary / Ternary
             setPlain("gridModeParam", static_cast<float>(scaleInt(0, 1)));
+            debugLastCCAccepted.store(true);
             return true;
 
-        case 24: // Swing: 0%..75%
-            setPlain("globalSwingParam", scaleFloat(0.0f, 75.0f));
+        case 23: // Rate: 0=Augmented, 1=Normal, 2=Diminished
+            setPlain("globalRateParam", static_cast<float>(scaleInt(0, 2)));
+            debugLastCCAccepted.store(true);
+            return true;
+
+        case 24: // Swing: 0=Off, 1=Triplet, 2=Shuffle
+            setPlain("globalSwingParam", static_cast<float>(scaleInt(0, 2)));
+            debugLastCCAccepted.store(true);
             return true;
 
         case 30: // P1 Transpose
             setPlain(getTransposeParameterID(0), static_cast<float>(scaleInt(-48, 48)));
+            debugLastCCAccepted.store(true);
             return true;
 
         case 31: // P1 Rotation
             setPlain(getRotationParameterID(0), static_cast<float>(scaleInt(0, patternLength - 1)));
+            debugLastCCAccepted.store(true);
             return true;
 
         case 32: // P1 Length
             setPlain(getLengthParameterID(0), static_cast<float>(scaleInt(minPatternLoopLength, patternLength)));
+            debugLastCCAccepted.store(true);
             return true;
 
         case 33: // P1 Inversion
             setPlain(getInversionParameterID(0), ccValue >= 64 ? 1.0f : 0.0f);
+            debugLastCCAccepted.store(true);
+            return true;
+
+        case 34: // P1 Retrograde
+            setPlain(getRetrogradeParameterID(0), ccValue >= 64 ? 1.0f : 0.0f);
+            debugLastCCAccepted.store(true);
+            return true;
+
+        case 35: // P1 M7
+            setPlain(getM7ParameterID(0), ccValue >= 64 ? 1.0f : 0.0f);
+            debugLastCCAccepted.store(true);
             return true;
 
         case 40: // P2 Transpose
             setPlain(getTransposeParameterID(1), static_cast<float>(scaleInt(-48, 48)));
+            debugLastCCAccepted.store(true);
             return true;
 
         case 41: // P2 Rotation
             setPlain(getRotationParameterID(1), static_cast<float>(scaleInt(0, patternLength - 1)));
+            debugLastCCAccepted.store(true);
             return true;
 
         case 42: // P2 Length
             setPlain(getLengthParameterID(1), static_cast<float>(scaleInt(minPatternLoopLength, patternLength)));
+            debugLastCCAccepted.store(true);
             return true;
 
         case 43: // P2 Inversion
             setPlain(getInversionParameterID(1), ccValue >= 64 ? 1.0f : 0.0f);
+            debugLastCCAccepted.store(true);
+            return true;
+
+        case 44: // P2 Retrograde
+            setPlain(getRetrogradeParameterID(1), ccValue >= 64 ? 1.0f : 0.0f);
+            debugLastCCAccepted.store(true);
+            return true;
+
+        case 45: // P2 M7
+            setPlain(getM7ParameterID(1), ccValue >= 64 ? 1.0f : 0.0f);
+            debugLastCCAccepted.store(true);
             return true;
 
         case 50: // P3 Transpose
             setPlain(getTransposeParameterID(2), static_cast<float>(scaleInt(-48, 48)));
+            debugLastCCAccepted.store(true);
             return true;
 
         case 51: // P3 Rotation
             setPlain(getRotationParameterID(2), static_cast<float>(scaleInt(0, patternLength - 1)));
+            debugLastCCAccepted.store(true);
             return true;
 
         case 52: // P3 Length
             setPlain(getLengthParameterID(2), static_cast<float>(scaleInt(minPatternLoopLength, patternLength)));
+            debugLastCCAccepted.store(true);
             return true;
 
         case 53: // P3 Inversion
             setPlain(getInversionParameterID(2), ccValue >= 64 ? 1.0f : 0.0f);
+            debugLastCCAccepted.store(true);
+            return true;
+
+        case 54: // P3 Retrograde
+            setPlain(getRetrogradeParameterID(2), ccValue >= 64 ? 1.0f : 0.0f);
+            debugLastCCAccepted.store(true);
+            return true;
+
+        case 55: // P3 M7
+            setPlain(getM7ParameterID(2), ccValue >= 64 ? 1.0f : 0.0f);
+            debugLastCCAccepted.store(true);
+            return true;
+
+        // Target Step Editing (60-64): external CC drives the same Target parameters the
+        // plugin's own UI uses, so the existing syncEngineFromParameters() polling/edge-detection
+        // (selection change -> browse, value change -> commit) is the safety mechanism here too -
+        // no separate queue needed. A CC 60 (select step) landing in a different processBlock than
+        // its CC 61-64 (note/velocity/duration/enabled) is the same as a human moving one slider at
+        // a time in the UI; only a genuine one-block race straddling a boundary is a known,
+        // accepted residual risk.
+        case 60: // Target Step
+            setPlain("targetStepParam", static_cast<float>(scaleInt(1, patternLength)));
+            debugLastCCAccepted.store(true);
+            return true;
+
+        case 61: // Target Note
+            setPlain("targetNoteParam", static_cast<float>(scaleInt(0, 127)));
+            debugLastCCAccepted.store(true);
+            return true;
+
+        case 62: // Target Velocity
+            setPlain("targetVelocityParam", static_cast<float>(scaleInt(1, 127)));
+            debugLastCCAccepted.store(true);
+            return true;
+
+        case 63: // Target Duration
+            setPlain("targetDurationParam", static_cast<float>(scaleInt(1, patternLength)));
+            debugLastCCAccepted.store(true);
+            return true;
+
+        case 64: // Target Enabled
+            setPlain("targetEnabledParam", ccValue >= 64 ? 1.0f : 0.0f);
+            debugLastCCAccepted.store(true);
             return true;
 
         default:
@@ -1850,6 +2235,19 @@ void MidiPatternLauncherAudioProcessor::processBlock(juce::AudioBuffer<float>& b
     const int gridStepCount = getGridStepCount();
     const double gridStepLengthInPpq = 4.0 / static_cast<double> (gridStepCount);
 
+    // v1.29.0 Rate: a real classical augmentation/diminution device - the whole
+    // active pattern restated in longer (Augmented, 0.5x) or shorter (Diminished,
+    // 2x) note values, onsets AND durations both scaling together. Dividing the
+    // ppq-per-step value by the rate multiplier is the single substantive engine
+    // change this requires: everything below that derives its timing from "how
+    // many ppq is one step" (grid-line detection, note-on placement, swing delay,
+    // and - via the stepPpq/gridStepLengthInPpq math note-offs re-derive at check
+    // time - note-off placement too) scales for free. Which stored step plays is
+    // separate, step-index arithmetic (playbackStepIndex/sourceStepIndex below)
+    // and is intentionally untouched: Rate changes WHEN steps land, never WHICH
+    // step or note plays. See getGlobalRateMultiplier().
+    const double effectiveGridStepLengthInPpq = gridStepLengthInPpq / getGlobalRateMultiplier();
+
     //==============================================================================
     // 4. Determine which metric grid lines occur inside this block.
     //
@@ -1859,15 +2257,15 @@ void MidiPatternLauncherAudioProcessor::processBlock(juce::AudioBuffer<float>& b
     // Bar-boundary actions and note-offs still use the unswung grid lines that
     // actually occur inside this block.
 
-    const int firstGridStepInBlock = static_cast<int> (std::ceil(ppqStart / gridStepLengthInPpq));
-    const int lastStepInBlock = static_cast<int> (std::floor(ppqEnd / gridStepLengthInPpq));
+    const int firstGridStepInBlock = static_cast<int> (std::ceil(ppqStart / effectiveGridStepLengthInPpq));
+    const int lastStepInBlock = static_cast<int> (std::floor(ppqEnd / effectiveGridStepLengthInPpq));
     const int firstStepForNoteOns = firstGridStepInBlock - 1;
 
     constexpr int midiChannel = 1;
 
     for (int step = firstStepForNoteOns; step <= lastStepInBlock; ++step)
     {
-        const double stepPpq = static_cast<double> (step) * gridStepLengthInPpq;
+        const double stepPpq = static_cast<double> (step) * effectiveGridStepLengthInPpq;
         const bool gridStepIsInsideThisBlock = step >= firstGridStepInBlock;
 
         int sampleOffset = static_cast<int> (std::round((stepPpq - ppqStart) / ppqPerSample));
@@ -1981,10 +2379,13 @@ void MidiPatternLauncherAudioProcessor::processBlock(juce::AudioBuffer<float>& b
 
             // v1.18.0:
             // Swing delays odd loop-relative playback steps in musical time.
-            // 75% Swing means a delay of 37.5% of one grid step, because the
-            // maximum delay is half a grid step multiplied by the swing amount.
+            // 100% Swing (Shuffle) means a delay of exactly half a grid step,
+            // because the maximum delay is half a grid step multiplied by
+            // the swing amount - which lands the swung note precisely at the
+            // midpoint between its neighbours, the true 3:1 dotted-shuffle
+            // ratio (v1.28.1).
             const double swingDelayPpq = shouldSwingStep
-                ? gridStepLengthInPpq * 0.5 * swingFraction
+                ? effectiveGridStepLengthInPpq * 0.5 * swingFraction
                 : 0.0;
 
             const double noteOnPpq = stepPpq + swingDelayPpq;
@@ -2049,6 +2450,8 @@ void MidiPatternLauncherAudioProcessor::getStateInformation(juce::MemoryBlock& d
         patternXml->setAttribute("rotation", patternRotation[static_cast<size_t>(patternIndex)]);
         patternXml->setAttribute("length", getPatternLoopLength(patternIndex));
         patternXml->setAttribute("inverted", patternInverted[static_cast<size_t>(patternIndex)] ? 1 : 0);
+        patternXml->setAttribute("retrograde", patternRetrograde[static_cast<size_t>(patternIndex)] ? 1 : 0);
+        patternXml->setAttribute("m7", patternM7[static_cast<size_t>(patternIndex)] ? 1 : 0);
 
         for (int stepIndex = 0; stepIndex < patternLength; ++stepIndex)
         {
@@ -2113,6 +2516,12 @@ void MidiPatternLauncherAudioProcessor::setStateInformation(const void* data, in
         patternInverted[static_cast<size_t>(patternIndex)] =
             patternXml->getIntAttribute("inverted", 0) != 0;
 
+        patternRetrograde[static_cast<size_t>(patternIndex)] =
+            patternXml->getIntAttribute("retrograde", 0) != 0;
+
+        patternM7[static_cast<size_t>(patternIndex)] =
+            patternXml->getIntAttribute("m7", 0) != 0;
+
         for (auto* stepXml : patternXml->getChildWithTagNameIterator("Step"))
         {
             const int stepIndex = stepXml->getIntAttribute("index", -1);
@@ -2172,7 +2581,12 @@ void MidiPatternLauncherAudioProcessor::setStateInformation(const void* data, in
     for (int patternIndex = 0; patternIndex < numPatterns; ++patternIndex)
         syncParametersFromPattern(patternIndex);
 
-    lastActivePatternParam = getChoiceParameterIndex("activePatternParam");
+    // Sentinel (see prepareToPlay) rather than syncing to the just-restored
+    // knob value directly - that previously hid the "change" from
+    // syncEngineFromParameters() and left playback silently stopped until a
+    // manual knob nudge. This guarantees the next processBlock's poll sees a
+    // mismatch and queues whatever pattern the restored knob shows.
+    lastActivePatternParam = -1;
 
     lastTargetPatternParam = getTargetPatternIndex();
     lastTargetStepParam = getTargetStepIndex() + 1;

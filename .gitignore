@@ -1,41 +1,45 @@
-# Build outputs
-Builds/VisualStudio2022/x64/
-Builds/VisualStudio2022/.vs/
-Builds/VisualStudio2022/Debug/
-Builds/VisualStudio2022/Release/
+# Build output
+build/
+build-cmake/
+cmake-build-*/
+out/
+Release/
+Debug/
 
-# Visual Studio temporary files
+# Projucer / Visual Studio build tree
+Builds/
+JuceLibraryCode/modules/
 .vs/
-*.user
-*.suo
-*.VC.db
-*.VC.opendb
-*.pdb
-*.ilk
-*.obj
-*.tlog
-*.log
-*.lastbuildstate
-*.ipch
-*.aps
-*.ncb
-*.opensdf
-*.sdf
 
 # Compiled binaries
-*.dll
 *.vst3
+*.dll
 *.exe
 *.lib
 *.exp
+*.obj
+*.pdb
+*.ilk
 
-# macOS, if ever used
+# JUCE / IDE
+*.xcuserstate
+*.suo
+*.user
+*.VC.db
+*.VC.opendb
+.idea/
+.vscode/
+
+# OS
 .DS_Store
+Thumbs.db
 
-# JUCE generated cache
-JuceLibraryCode/modules/
-Builds/
-Builds/
+# Temporary / cache
+*.tmp
+*.log
+*.zip
 
-# CMake out-of-source build
-build-cmake/
+# Composer Mastermind lives in its own git repo in this subfolder
+# (NewProject/ is the MPL repo root; ComposerMastermind/ is a separate
+# project that just physically sits here). Never version it from here.
+ComposerMastermind/

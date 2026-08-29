@@ -24,6 +24,8 @@ private:
     juce::String transposeTextFromValue(int value) const;
     juce::String rotationTextFromValue(int value) const;
     juce::String inversionTextFromValue(bool value) const;
+    juce::String retrogradeTextFromValue(bool value) const;
+    juce::String m7TextFromValue(bool value) const;
 
     int getDisplayedPattern() const;
     juce::Rectangle<int> getPatternMatrixArea() const;
@@ -154,6 +156,8 @@ private:
     juce::TextButton rotationResetButton{ "Rot 0" };
     juce::TextButton rotationUpButton{ "Rot +" };
     juce::TextButton inversionToggleButton{ "Inv Off" };
+    juce::TextButton retrogradeToggleButton{ "Retro Off" };
+    juce::TextButton m7ToggleButton{ "M7 Off" };
 
     juce::Label targetTitleLabel;
     juce::Label targetPatternLabel;
@@ -164,19 +168,25 @@ private:
     juce::Label targetVelocityLabel;
     juce::Label targetDurationLabel;
     juce::Label globalSwingLabel;
+    juce::Label globalRateLabel;
     juce::Label targetEnabledLabel;
     juce::Label externalControlLabel;
     juce::Label externalControlChannelLabel;
+    juce::Label midiDebugLabel;
+    juce::ToggleButton externalControlToggle;
+    std::unique_ptr<juce::AudioProcessorValueTreeState::ButtonAttachment> externalControlToggleAttachment;
+
 
     juce::ComboBox targetPatternBox;
     juce::ComboBox gridModeBox;
     juce::ComboBox editorViewModeBox;
+    juce::ComboBox globalSwingBox;
+    juce::ComboBox globalRateBox;
     juce::Slider targetStepSlider;
 
     juce::Slider targetNoteSlider;
     juce::Slider targetVelocitySlider;
     juce::Slider targetDurationSlider;
-    juce::Slider globalSwingSlider;
     juce::ToggleButton targetEnabledButton{ "Enabled" };
     juce::ToggleButton externalControlEnabledButton{ "Ext Ctrl" };
     juce::ComboBox externalControlChannelBox;
@@ -184,11 +194,12 @@ private:
     std::unique_ptr<ComboBoxAttachment> targetPatternAttachment;
     std::unique_ptr<ComboBoxAttachment> gridModeAttachment;
     std::unique_ptr<ComboBoxAttachment> editorViewModeAttachment;
+    std::unique_ptr<ComboBoxAttachment> globalSwingAttachment;
+    std::unique_ptr<ComboBoxAttachment> globalRateAttachment;
     std::unique_ptr<SliderAttachment> targetStepAttachment;
     std::unique_ptr<SliderAttachment> targetNoteAttachment;
     std::unique_ptr<SliderAttachment> targetVelocityAttachment;
     std::unique_ptr<SliderAttachment> targetDurationAttachment;
-    std::unique_ptr<SliderAttachment> globalSwingAttachment;
     std::unique_ptr<ButtonAttachment> targetEnabledAttachment;
     std::unique_ptr<ButtonAttachment> externalControlEnabledAttachment;
     std::unique_ptr<ComboBoxAttachment> externalControlChannelAttachment;

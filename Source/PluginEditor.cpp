@@ -5,7 +5,9 @@ MidiPatternLauncherAudioProcessorEditor::MidiPatternLauncherAudioProcessorEditor
     : AudioProcessorEditor(&p),
     audioProcessor(p)
 {
-    setSize(900, 760);
+    // v1.29.0: +32 over the historical 760 to make room for the new Rate row
+    // (targetRow3) split out from what used to be one overflowing targetRow2.
+    setSize(900, 792);
 
     addAndMakeVisible(editPattern1Button);
     addAndMakeVisible(editPattern2Button);
@@ -35,6 +37,8 @@ MidiPatternLauncherAudioProcessorEditor::MidiPatternLauncherAudioProcessorEditor
     addAndMakeVisible(rotationResetButton);
     addAndMakeVisible(rotationUpButton);
     addAndMakeVisible(inversionToggleButton);
+    addAndMakeVisible(retrogradeToggleButton);
+    addAndMakeVisible(m7ToggleButton);
 
     auto setupLabel = [](juce::Label& label, const juce::String& text)
         {
@@ -52,6 +56,7 @@ MidiPatternLauncherAudioProcessorEditor::MidiPatternLauncherAudioProcessorEditor
     setupLabel(targetVelocityLabel, "Velocity");
     setupLabel(targetDurationLabel, "Duration");
     setupLabel(globalSwingLabel, "Swing");
+    setupLabel(globalRateLabel, "Rate");
     setupLabel(targetEnabledLabel, "Enabled");
     setupLabel(externalControlLabel, "External");
     setupLabel(externalControlChannelLabel, "Channel");
@@ -65,6 +70,7 @@ MidiPatternLauncherAudioProcessorEditor::MidiPatternLauncherAudioProcessorEditor
     addAndMakeVisible(targetVelocityLabel);
     addAndMakeVisible(targetDurationLabel);
     addAndMakeVisible(globalSwingLabel);
+    addAndMakeVisible(globalRateLabel);
     addAndMakeVisible(targetEnabledLabel);
     addAndMakeVisible(externalControlLabel);
     addAndMakeVisible(externalControlChannelLabel);
@@ -75,6 +81,14 @@ MidiPatternLauncherAudioProcessorEditor::MidiPatternLauncherAudioProcessorEditor
 
     gridModeBox.addItem("Binary 16", 1);
     gridModeBox.addItem("Ternary 12", 2);
+
+    globalSwingBox.addItem("Off", 1);
+    globalSwingBox.addItem("Triplet", 2);
+    globalSwingBox.addItem("Shuffle", 3);
+
+    globalRateBox.addItem("Augmented", 1);
+    globalRateBox.addItem("Normal", 2);
+    globalRateBox.addItem("Diminished", 3);
 
     editorViewModeBox.addItem("Matrix", 1);
     editorViewModeBox.addItem("Melody", 2);
@@ -96,23 +110,42 @@ MidiPatternLauncherAudioProcessorEditor::MidiPatternLauncherAudioProcessorEditor
     setupSlider(targetNoteSlider);
     setupSlider(targetVelocitySlider);
     setupSlider(targetDurationSlider);
-    setupSlider(globalSwingSlider);
-
-    globalSwingSlider.setSliderStyle(juce::Slider::LinearHorizontal);
-    globalSwingSlider.setTextBoxStyle(juce::Slider::TextBoxRight, false, 56, 22);
-    globalSwingSlider.setTextValueSuffix("%");
 
     addAndMakeVisible(targetPatternBox);
     addAndMakeVisible(gridModeBox);
     addAndMakeVisible(editorViewModeBox);
+    addAndMakeVisible(globalSwingBox);
+    addAndMakeVisible(globalRateBox);
     addAndMakeVisible(targetStepSlider);
     addAndMakeVisible(targetNoteSlider);
     addAndMakeVisible(targetVelocitySlider);
     addAndMakeVisible(targetDurationSlider);
-    addAndMakeVisible(globalSwingSlider);
     addAndMakeVisible(targetEnabledButton);
     addAndMakeVisible(externalControlEnabledButton);
     addAndMakeVisible(externalControlChannelBox);
+
+    midiDebugLabel.setText("Last CC: none", juce::dontSendNotification);
+    midiDebugLabel.setColour(juce::Label::textColourId, juce::Colours::white);
+    midiDebugLabel.setJustificationType(juce::Justification::centredLeft);
+    addAndMakeVisible(midiDebugLabel);
+
+    externalControlToggle.setButtonText("External Control");
+    externalControlToggle.setClickingTogglesState(true);
+    addAndMakeVisible(externalControlToggle);
+
+    externalControlToggleAttachment = std::make_unique<juce::AudioProcessorValueTreeState::ButtonAttachment>(
+        audioProcessor.getApvts(),
+        "externalControlEnabledParam",
+        externalControlToggle);
+
+
+    externalControlToggle.setButtonText("External Control");
+    addAndMakeVisible(externalControlToggle);
+
+    externalControlToggleAttachment = std::make_unique<juce::AudioProcessorValueTreeState::ButtonAttachment>(
+        audioProcessor.getApvts(),
+        "externalControlEnabledParam",
+        externalControlToggle);
 
     auto& apvts = audioProcessor.getAPVTS();
 
@@ -137,8 +170,11 @@ MidiPatternLauncherAudioProcessorEditor::MidiPatternLauncherAudioProcessorEditor
     targetDurationAttachment = std::make_unique<SliderAttachment>(
         apvts, "targetDurationParam", targetDurationSlider);
 
-    globalSwingAttachment = std::make_unique<SliderAttachment>(
-        apvts, "globalSwingParam", globalSwingSlider);
+    globalSwingAttachment = std::make_unique<ComboBoxAttachment>(
+        apvts, "globalSwingParam", globalSwingBox);
+
+    globalRateAttachment = std::make_unique<ComboBoxAttachment>(
+        apvts, "globalRateParam", globalRateBox);
 
     targetEnabledAttachment = std::make_unique<ButtonAttachment>(
         apvts, "targetEnabledParam", targetEnabledButton);
@@ -342,6 +378,22 @@ void MidiPatternLauncherAudioProcessorEditor::setupButtonCallbacks()
             audioProcessor.updateAutomationParametersForPattern(pattern);
             repaint();
         };
+
+    retrogradeToggleButton.onClick = [this]()
+        {
+            const int pattern = getDisplayedPattern();
+            audioProcessor.togglePatternRetrograde(pattern);
+            audioProcessor.updateAutomationParametersForPattern(pattern);
+            repaint();
+        };
+
+    m7ToggleButton.onClick = [this]()
+        {
+            const int pattern = getDisplayedPattern();
+            audioProcessor.togglePatternM7(pattern);
+            audioProcessor.updateAutomationParametersForPattern(pattern);
+            repaint();
+        };
 }
 
 void MidiPatternLauncherAudioProcessorEditor::updateEditPatternButtonHighlights()
@@ -373,6 +425,27 @@ void MidiPatternLauncherAudioProcessorEditor::timerCallback()
 {
     selectedEditPattern = audioProcessor.getTargetPatternIndex();
     selectedStep = audioProcessor.getTargetStepIndex();
+
+    juce::String debugText = "Last CC: ";
+
+    const int cc = audioProcessor.getDebugLastCCNumber();
+    const int ch = audioProcessor.getDebugLastCCChannel();
+    const int val = audioProcessor.getDebugLastCCValue();
+    const bool accepted = audioProcessor.getDebugLastCCAccepted();
+
+    if (cc < 0)
+    {
+        debugText += "none";
+    }
+    else
+    {
+        debugText << "CC " << cc
+                  << " ch " << ch
+                  << " val " << val
+                  << " | " << (accepted ? "accepted" : "ignored");
+    }
+
+    midiDebugLabel.setText(debugText, juce::dontSendNotification);
 
     updateEditPatternButtonHighlights();
     repaint();
@@ -421,6 +494,16 @@ juce::String MidiPatternLauncherAudioProcessorEditor::transposeTextFromValue(int
 }
 
 juce::String MidiPatternLauncherAudioProcessorEditor::inversionTextFromValue(bool value) const
+{
+    return value ? "On" : "Off";
+}
+
+juce::String MidiPatternLauncherAudioProcessorEditor::retrogradeTextFromValue(bool value) const
+{
+    return value ? "On" : "Off";
+}
+
+juce::String MidiPatternLauncherAudioProcessorEditor::m7TextFromValue(bool value) const
 {
     return value ? "On" : "Off";
 }
@@ -1675,6 +1758,8 @@ void MidiPatternLauncherAudioProcessorEditor::paint(juce::Graphics& g)
     const int patternTranspose = audioProcessor.getPatternTranspose(displayedPattern);
     const int patternRotation = audioProcessor.getPatternRotation(displayedPattern);
     const bool patternInverted = audioProcessor.getPatternInverted(displayedPattern);
+    const bool patternRetrograde = audioProcessor.getPatternRetrograde(displayedPattern);
+    const bool patternM7 = audioProcessor.getPatternM7(displayedPattern);
 
     auto bounds = getLocalBounds().reduced(24);
 
@@ -1692,7 +1777,7 @@ void MidiPatternLauncherAudioProcessorEditor::paint(juce::Graphics& g)
 
     g.setFont(14.0f);
     g.setColour(juce::Colour(0xffcfe8ef));
-    g.drawFittedText("v1.24.0 - Composer Bridge",
+    g.drawFittedText("v1.28.1 - Composer Bridge v2",
         titleRow,
         juce::Justification::centredRight,
         1);
@@ -2058,12 +2143,16 @@ void MidiPatternLauncherAudioProcessorEditor::paint(juce::Graphics& g)
             const int rowRotation = audioProcessor.getPatternRotation(patternIndex);
             const int rowLength = juce::jmin(audioProcessor.getPatternLoopLength(patternIndex), gridStepCount);
             const bool rowInverted = audioProcessor.getPatternInverted(patternIndex);
+            const bool rowRetrograde = audioProcessor.getPatternRetrograde(patternIndex);
+            const bool rowM7 = audioProcessor.getPatternM7(patternIndex);
 
             juce::String transformText;
             transformText << "Tr " << transposeTextFromValue(rowTranspose)
                 << " Rot " << rotationTextFromValue(rowRotation)
                 << " Len " << rowLength
-                << "\nInv " << inversionTextFromValue(rowInverted);
+                << "\nInv " << inversionTextFromValue(rowInverted)
+                << " Retro " << retrogradeTextFromValue(rowRetrograde)
+                << "\nM7 " << m7TextFromValue(rowM7);
 
             juce::ignoreUnused(transformGap);
 
@@ -2072,7 +2161,7 @@ void MidiPatternLauncherAudioProcessorEditor::paint(juce::Graphics& g)
             g.drawFittedText(transformText,
                 transformBox,
                 juce::Justification::centredLeft,
-                2);
+                3);
         }
 
     }
@@ -2136,6 +2225,17 @@ void MidiPatternLauncherAudioProcessorEditor::paint(juce::Graphics& g)
                 juce::Justification::centredLeft,
                 1);
 
+            textBox.removeFromTop(4);
+
+            g.setColour(juce::Colour(0xffcfe8ef));
+            g.setFont(12.0f);
+            g.drawFittedText(
+                midiDebugLabel.getText() + "    |    External Control: "
+                    + juce::String(externalControlToggle.getToggleState() ? "On" : "Off"),
+                textBox.removeFromTop(18),
+                juce::Justification::centredLeft,
+                1);
+
         }
     }
 
@@ -2158,12 +2258,14 @@ void MidiPatternLauncherAudioProcessorEditor::paint(juce::Graphics& g)
     editorText << "Tr: " << transposeTextFromValue(patternTranspose) << "    ";
     editorText << "Rot: " << rotationTextFromValue(patternRotation) << "    ";
     editorText << "Inv: " << inversionTextFromValue(patternInverted) << "    ";
+    editorText << "Retro: " << retrogradeTextFromValue(patternRetrograde) << "    ";
+    editorText << "M7: " << m7TextFromValue(patternM7) << "    ";
 
     if (selectedHasNote)
     {
         editorText << "Note: " << selectedNote;
 
-        if (patternTranspose != 0 || patternInverted)
+        if (patternTranspose != 0 || patternInverted || patternM7)
             editorText << " -> " << selectedTransformedNote;
 
         editorText << "    ";
@@ -2181,6 +2283,8 @@ void MidiPatternLauncherAudioProcessorEditor::paint(juce::Graphics& g)
         2);
 
     inversionToggleButton.setButtonText(patternInverted ? "Inv On" : "Inv Off");
+    retrogradeToggleButton.setButtonText(patternRetrograde ? "Retro On" : "Retro Off");
+    m7ToggleButton.setButtonText(patternM7 ? "M7 On" : "M7 Off");
 
     // Bottom controls are real buttons laid out in resized().
 }
@@ -2300,9 +2404,14 @@ void MidiPatternLauncherAudioProcessorEditor::resized()
     transformRow.removeFromLeft(transformSectionGap);
 
     inversionToggleButton.setBounds(transformRow.removeFromLeft(transformButtonWidth));
+    transformRow.removeFromLeft(transformGap);
+
+    retrogradeToggleButton.setBounds(transformRow.removeFromLeft(transformButtonWidth));
+    transformRow.removeFromLeft(transformGap);
+
+    m7ToggleButton.setBounds(transformRow.removeFromLeft(transformButtonWidth));
 
     bounds.removeFromTop(4);
-
     //==========================================================================
     // Host target parameters
 
@@ -2346,18 +2455,27 @@ void MidiPatternLauncherAudioProcessorEditor::resized()
 
     targetDurationLabel.setBounds(targetRow2.removeFromLeft(targetLabelWidth));
     targetDurationSlider.setBounds(targetRow2.removeFromLeft(targetControlWidth));
-    targetRow2.removeFromLeft(targetGap);
 
-    globalSwingLabel.setBounds(targetRow2.removeFromLeft(targetLabelWidth));
-    globalSwingSlider.setBounds(targetRow2.removeFromLeft(targetControlWidth));
-    targetRow2.removeFromLeft(targetGap);
+    bounds.removeFromTop(6);
 
-    externalControlLabel.setBounds(targetRow2.removeFromLeft(64));
-    externalControlEnabledButton.setBounds(targetRow2.removeFromLeft(90));
-    targetRow2.removeFromLeft(targetGap);
+    auto targetRow3 = bounds.removeFromTop(26);
 
-    externalControlChannelLabel.setBounds(targetRow2.removeFromLeft(64));
-    externalControlChannelBox.setBounds(targetRow2.removeFromLeft(90));
+    globalSwingLabel.setBounds(targetRow3.removeFromLeft(targetLabelWidth));
+    globalSwingBox.setBounds(targetRow3.removeFromLeft(targetControlWidth));
+    targetRow3.removeFromLeft(targetGap);
+
+    // v1.29.0: Rate sits next to Swing - both are "groove" controls that shape
+    // WHEN steps land rather than WHICH note plays.
+    globalRateLabel.setBounds(targetRow3.removeFromLeft(targetLabelWidth));
+    globalRateBox.setBounds(targetRow3.removeFromLeft(targetControlWidth));
+    targetRow3.removeFromLeft(targetGap);
+
+    externalControlLabel.setBounds(targetRow3.removeFromLeft(64));
+    externalControlEnabledButton.setBounds(targetRow3.removeFromLeft(90));
+    targetRow3.removeFromLeft(targetGap);
+
+    externalControlChannelLabel.setBounds(targetRow3.removeFromLeft(64));
+    externalControlChannelBox.setBounds(targetRow3.removeFromLeft(90));
 }
 
 
